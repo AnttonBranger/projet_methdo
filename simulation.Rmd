@@ -1,0 +1,142 @@
+---
+title: "Simulation"
+author: "Branger Antton"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+rm(list = ls())
+```
+
+Chargement des packages
+```{r}
+library(dplyr)
+library(survey)
+```
+# Génération des données
+
+Définition des paramètres 
+```{r}
+N <- 20000   
+nA <- 500   
+nB <- 2000    
+rho_target <- 0.5
+```
+
+Génération des données
+```{r}
+set.seed(42)
+
+Z1 <- rbinom(N, 1, 0.5)         
+Z2 <- runif(N, 0, 2)           
+Z3 <- rexp(N, rate = 1)     
+Z4 <- rchisq(N, df = 4)   
+Epsilon <- rnorm(N, 0, 1)  
+
+X1 <- Z1
+X2 <- Z2 + 0.3 * X1
+X3 <- Z3 + 0.2 * (X1 + X2)
+X4 <- Z4 + 0.1 * (X1 + X2 + X3)
+
+df <- data.frame(id = 1:N, X1, X2, X3, X4, Epsilon)
+```
+
+Calcul de sigma basé sur la corrélation cible
+```{r}
+df <- df %>%
+  mutate(Eta = X1 + X2 + X3 + X4)
+
+Var_Eta <- var(df$Eta)
+
+sigma <- sqrt(Var_Eta * (1 - rho_target^2) / rho_target^2)
+cat(paste("Valeur de sigma (pour rho = 0.5) calculée:", round(sigma, 4), "\n"))
+```
+
+Génération de la variable Y
+```{r}
+df <- df %>%
+  mutate(Y = 2 + Eta + sigma * Epsilon)
+
+cor_check <- cor(df$Y, df$Eta)
+cat(paste("Corrélation obtenue Corr(Y, Eta):", round(cor_check, 4), "\n"))
+```
+
+# Calcul de la proba d'inclusion pour l'echantillon non-probabiliste
+
+```{r}
+df <- df %>%
+  mutate(Linear_Predictor_A = 0.5 * X1 + 0.5 * X2 + 0.3 * X3 + 0.3 * X4)
+```
+
+Fonction pour trouver theta0 tel que somme(pi_A) = nA (utilisant le solveur de racine)
+```{r}
+solve_theta0 <- function(theta0, data, nA_target) {
+  pi_A <- 1 / (1 + exp(-(theta0 + data$Linear_Predictor_A)))
+  return(sum(pi_A) - nA_target)
+}
+
+theta0_solution <- uniroot(
+  f = solve_theta0,
+  interval = c(-10, 10), # Intervalle de recherche
+  data = df,
+  nA_target = nA
+)
+
+theta0 <- theta0_solution$root
+cat(paste("Valeur de theta0 (pour nA = 500) calculée:", round(theta0, 4), "\n"))
+```
+
+Calcul des scores de propension finaux pi_A
+```{r}
+df <- df %>%
+  mutate(pi_A = 1 / (1 + exp(-(theta0 + Linear_Predictor_A))))
+cat(paste("Somme des pi_A obtenue:", round(sum(df$pi_A), 2), "\n"))
+```
+
+# Calcul de la proba d'inclusion pour l'echantillon probabiliste
+
+Support d'inclusion : zi = c + X3 + O.03Y
+```{r}
+df <- df %>%
+  mutate(Z_support_base = X3 + 0.03 * Y)
+```
+
+Contrainte : max(zi) / min(zi) = 50
+```{r}
+V_max <- max(df$Z_support_base)
+V_min <- min(df$Z_support_base)
+
+c_val <- (V_max - 50 * V_min) / 49
+
+cat(paste("Valeur de c (pour max(zi)/min(zi) = 50) calculée:", round(c_val, 4), "\n"))
+```
+
+Calcul des poids de support z_i
+```{r}
+df <- df %>%
+  mutate(Z_i = c_val + Z_support_base)
+
+check_zi_ratio <- max(df$Z_i) / min(df$Z_i)
+cat(paste("Ratio max(zi)/min(zi) obtenu:", round(check_zi_ratio, 2), "\n"))
+```
+
+Calcul des scores de propension finaux pi_B (Poisson sampling avec taille cible nB)
+```{r}
+scaling_factor_B <- nB / sum(df$Z_i)
+
+df <- df %>%
+  mutate(pi_B = Z_i * scaling_factor_B)
+
+cat(paste("Somme des pi_B obtenue:", round(sum(df$pi_B), 2), "\n"))
+```
+
+Affichage des résultats
+```{r}
+print(head(df %>% select(X1, X2, X3, X4, Y, pi_A, pi_B)))
+```
+
