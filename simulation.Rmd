@@ -16,127 +16,134 @@ rm(list = ls())
 Chargement des packages
 ```{r}
 library(dplyr)
-library(survey)
+library(sampling)
 ```
-# Génération des données
+
+
+# Paramètres et fonctions
 
 Définition des paramètres 
 ```{r}
-N <- 20000   
-nA <- 500   
-nB <- 2000    
-rho_target <- 0.5
+N <- 20000
+nA <- 500
+nB <- 1000
+B <- 5000
 ```
 
-Génération des données
+Fonction utilitaire 
 ```{r}
-set.seed(42)
-
-Z1 <- rbinom(N, 1, 0.5)         
-Z2 <- runif(N, 0, 2)           
-Z3 <- rexp(N, rate = 1)     
-Z4 <- rchisq(N, df = 4)   
-Epsilon <- rnorm(N, 0, 1)  
-
-X1 <- Z1
-X2 <- Z2 + 0.3 * X1
-X3 <- Z3 + 0.2 * (X1 + X2)
-X4 <- Z4 + 0.1 * (X1 + X2 + X3)
-
-df <- data.frame(id = 1:N, X1, X2, X3, X4, Epsilon)
+logit <- function(x) log(x / (1 - x))
+expit <- function(x) exp(x) / (1 + exp(x))
 ```
 
-Calcul de sigma basé sur la corrélation cible
+# Génération de la population 
+
 ```{r}
-df <- df %>%
-  mutate(Eta = X1 + X2 + X3 + X4)
+set.seed(123)
+z1 <- rbinom(N, 1, 0.5)
+z2 <- runif(N, 0, 2)
+z3 <- rexp(N, 1)
+z4 <- rchisq(N, 4)
 
-Var_Eta <- var(df$Eta)
+x1 <- z1
+x2 <- z2 + 0.3 * x1
+x3 <- z3 + 0.2 * (x1 + x2)
+x4 <- z4 + 0.1 * (x1 + x2 + x3)
 
-sigma <- sqrt(Var_Eta * (1 - rho_target^2) / rho_target^2)
-cat(paste("Valeur de sigma (pour rho = 0.5) calculée:", round(sigma, 4), "\n"))
+epsilon <- rnorm(N, 0, 1)
+y <- 2 + x1 + x2 + x3 + x4 + (1.0 * epsilon) 
+true_mu_y <- mean(y) 
 ```
 
-Génération de la variable Y
+# Mécanisme de sélection 
+
+Trouver theta0 pour que la somme des probabilités soit égale à nA
 ```{r}
-df <- df %>%
-  mutate(Y = 2 + Eta + sigma * Epsilon)
-
-cor_check <- cor(df$Y, df$Eta)
-cat(paste("Corrélation obtenue Corr(Y, Eta):", round(cor_check, 4), "\n"))
-```
-
-# Calcul de la proba d'inclusion pour l'echantillon non-probabiliste
-
-```{r}
-df <- df %>%
-  mutate(Linear_Predictor_A = 0.5 * X1 + 0.5 * X2 + 0.3 * X3 + 0.3 * X4)
-```
-
-Fonction pour trouver theta0 tel que somme(pi_A) = nA (utilisant le solveur de racine)
-```{r}
-solve_theta0 <- function(theta0, data, nA_target) {
-  pi_A <- 1 / (1 + exp(-(theta0 + data$Linear_Predictor_A)))
-  return(sum(pi_A) - nA_target)
+find_theta0 <- function(t0) {
+  sum(expit(t0 + 0.1*x1 + 0.2*x2 + 0.1*x3 + 0.2*x4)) - nA
 }
+```
 
-theta0_solution <- uniroot(
-  f = solve_theta0,
-  interval = c(-10, 10), # Intervalle de recherche
-  data = df,
-  nA_target = nA
+```{r}
+theta0 <- uniroot(find_theta0, c(-10, 10))$root
+pi_A_true <- expit(theta0 + 0.1*x1 + 0.2*x2 + 0.1*x3 + 0.2*x4)
+```
+
+# Echantillon de référence 
+
+```{r}
+z_PPS <- 2 + x3 # Variable de taille pour le propensity score 
+pi_B <- inclusionprobabilities(z_PPS, nB)
+dB <- 1/pi_B
+```
+
+# Boucle de simulation
+
+```{r}
+results <- replicate(B, {
+  
+  # A. Tirage des échantillons
+  # S_A : Poisson sampling 
+  R_A <- rbinom(N, 1, pi_A_true)
+  S_A_idx <- which(R_A == 1)
+  data_A <- data.frame(y = y[S_A_idx], x1 = x1[S_A_idx], x2 = x2[S_A_idx], 
+                       x3 = x3[S_A_idx], x4 = x4[S_A_idx])
+  
+  # S_B : PPS systématique 
+  S_B_idx <- which(UPsystematic(pi_B) == 1)
+  data_B <- data.frame(x1 = x1[S_B_idx], x2 = x2[S_B_idx], 
+                       x3 = x3[S_B_idx], x4 = x4[S_B_idx], d = dB[S_B_idx])
+  
+  # B. Estimation des scores de propension (Pseudo-ML) 
+  # On résout l'équation du score pour obtenir hat_theta
+  pseudo_log_lik <- function(theta) {
+    xb_A <- as.matrix(cbind(1, data_A[,2:5])) %*% theta
+    xb_B <- as.matrix(cbind(1, data_B[,1:4])) %*% theta
+    term1 <- sum(xb_A)
+    term2 <- sum(data_B$d * log(1 + exp(xb_B)))
+    return(term1 - term2)
+  }
+  
+  # Optimisation pour trouver hat_theta
+  res_theta <- optim(rep(0, 5), pseudo_log_lik, control = list(fnscale = -1), method = "BFGS")
+  hat_theta <- res_theta$par
+  
+  # Scores estimés pour S_A
+  pi_A_est <- expit(as.matrix(cbind(1, data_A[,2:5])) %*% hat_theta)
+  
+  # C. Modèle de régression (Outcome model) 
+  mod_reg <- lm(y ~ x1 + x2 + x3 + x4, data = data_A)
+  hat_beta <- coef(mod_reg)
+  
+  # Prédictions sur S_B
+  y_hat_B <- as.matrix(cbind(1, data_B[,1:4])) %*% hat_beta
+  
+  # D. Calcul des estimateurs 
+  # 1. IPW2
+  mu_IPW2 <- sum(data_A$y / pi_A_est) / sum(1 / pi_A_est)
+  
+  # 2. REG (Mass imputation)
+  mu_REG <- sum(data_B$d * y_hat_B) / sum(data_B$d)
+  
+  # 3. DR2 (Doubly Robust)
+  term_A <- sum((data_A$y - predict(mod_reg, data_A)) / pi_A_est) / sum(1 / pi_A_est)
+  term_B <- sum(data_B$d * y_hat_B) / sum(data_B$d)
+  mu_DR2 <- term_A + term_B
+  
+  return(c(IPW2 = mu_IPW2, REG = mu_REG, DR2 = mu_DR2))
+})
+```
+
+# Synthèse des résultats
+
+```{r}
+final_results <- data.frame(
+  True_Mean = true_mu_y,
+  Mean_Est = rowMeans(results),
+  RB_pct = (rowMeans(results) - true_mu_y) / true_mu_y * 100,
+  MSE = rowMeans((results - true_mu_y)^2)
 )
 
-theta0 <- theta0_solution$root
-cat(paste("Valeur de theta0 (pour nA = 500) calculée:", round(theta0, 4), "\n"))
-```
-
-Calcul des scores de propension finaux pi_A
-```{r}
-df <- df %>%
-  mutate(pi_A = 1 / (1 + exp(-(theta0 + Linear_Predictor_A))))
-cat(paste("Somme des pi_A obtenue:", round(sum(df$pi_A), 2), "\n"))
-```
-
-# Calcul de la proba d'inclusion pour l'echantillon probabiliste
-
-Support d'inclusion : zi = c + X3 + O.03Y
-```{r}
-df <- df %>%
-  mutate(Z_support_base = X3 + 0.03 * Y)
-```
-
-Contrainte : max(zi) / min(zi) = 50
-```{r}
-V_max <- max(df$Z_support_base)
-V_min <- min(df$Z_support_base)
-
-c_val <- (V_max - 50 * V_min) / 49
-
-cat(paste("Valeur de c (pour max(zi)/min(zi) = 50) calculée:", round(c_val, 4), "\n"))
-```
-
-Calcul des poids de support z_i
-```{r}
-df <- df %>%
-  mutate(Z_i = c_val + Z_support_base)
-
-check_zi_ratio <- max(df$Z_i) / min(df$Z_i)
-cat(paste("Ratio max(zi)/min(zi) obtenu:", round(check_zi_ratio, 2), "\n"))
-```
-
-Calcul des scores de propension finaux pi_B (Poisson sampling avec taille cible nB)
-```{r}
-scaling_factor_B <- nB / sum(df$Z_i)
-
-df <- df %>%
-  mutate(pi_B = Z_i * scaling_factor_B)
-
-cat(paste("Somme des pi_B obtenue:", round(sum(df$pi_B), 2), "\n"))
-```
-
-Affichage des résultats
-```{r}
-print(head(df %>% select(X1, X2, X3, X4, Y, pi_A, pi_B)))
+print(final_results)
 ```
 
